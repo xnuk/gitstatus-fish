@@ -1,11 +1,14 @@
 use std::collections::hash_map::{DefaultHasher, HashMap};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::str::{from_utf8, FromStr};
 use std::sync::{Arc, Mutex};
-use std::{env, iter, net, thread};
+use std::{env, iter, net, ops, thread};
+
+use anyhow::anyhow;
 
 macro_rules! git_repo {
 	(
@@ -101,7 +104,7 @@ impl<'a> ConvertField<'a> for u64 {
 impl<'a, T: ConvertField<'a>> ConvertField<'a> for Option<T> {
 	#[inline]
 	fn from_field(field: &'a [u8]) -> Option<Self> {
-		if field.len() == 0 {
+		if field.is_empty() {
 			None
 		} else {
 			Some(T::from_field(field))
@@ -109,7 +112,7 @@ impl<'a, T: ConvertField<'a>> ConvertField<'a> for Option<T> {
 	}
 }
 
-fn parse_response<'a>(bytes: &'a [u8]) -> Option<Response<'a>> {
+fn parse_response(bytes: &[u8]) -> Option<Response<'_>> {
 	let mut records =
 		bytes.split(|&b| b == FIELD_SEPARATOR || b == RECORD_SEPARATOR);
 	let id = records.next()?;
@@ -178,7 +181,7 @@ fn server(
 		while let Ok(len) = stdout.read_until(RECORD_SEPARATOR, &mut buf) {
 			buf.clear();
 
-			let a = parse_response(&buf[..len]);
+			let a = parse_response(&buf[..len]).expect("Unknown response");
 			println!("{a:?}");
 
 			let id = from_utf8(a.id)
@@ -189,7 +192,8 @@ fn server(
 				let mut in_queue = in_queue.lock().unwrap();
 
 				if let Some(origin) = in_queue.remove(&id) {
-					match socket.send_to(&a[1], origin) {
+					let body = format!("{a:?}");
+					match socket.send_to(body.as_bytes(), origin) {
 						Ok(_) => {}
 						Err(e) => {
 							eprintln!("Sending error: {origin} -> {e:?}");
@@ -211,8 +215,7 @@ fn server(
 		let (hash, request) =
 			make_request::<DefaultHasher>(&buf[..bytes], true);
 
-		stdin.write(&request)?;
-		stdin.flush()?;
+		stdin.write_all(&request)?;
 
 		{
 			in_queue.lock().unwrap().insert(hash, origin);
@@ -220,7 +223,10 @@ fn server(
 	}
 }
 
-fn client(from: net::SocketAddr, host: net::SocketAddr) -> io::Result<()> {
+fn client(
+	from: impl net::ToSocketAddrs,
+	host: net::SocketAddr,
+) -> io::Result<()> {
 	let socket = net::UdpSocket::bind(from)?;
 	socket.connect(host)?;
 
@@ -232,9 +238,114 @@ fn client(from: net::SocketAddr, host: net::SocketAddr) -> io::Result<()> {
 	Ok(())
 }
 
-fn main() -> io::Result<()> {
+const USAGE: &str = r#"
+Usage:
+	foo [options] [subcommand] [... subcommand args]
+
+Options:
+	--port=server:client
+		Set UDP port for server and client.
+		Client port can be a number range using hyphen(-).
+		Defaults to 8080 for server, 8081-8090 for client.
+
+		Example:
+			foo --port=8080:8081-8090 client .
+
+Subcommands:
+	client [dir]
+		Get git status for [dir].
+
+	server [gitstatusd path] [... gitstatusd options]
+		Run [gitstatusd path] and passes [... gitstatusd options] to it.
+"#;
+
+#[derive(Debug)]
+struct Cli {
+	server_port: u16,
+	client_port: ops::RangeInclusive<u16>,
+	command: CliCommand,
+}
+
+#[derive(Debug)]
+enum CliCommand {
+	Server {
+		gitstatusd_path: PathBuf,
+		gitstatusd_options: Vec<OsString>,
+	},
+	Client {
+		cwd: PathBuf,
+	},
+}
+
+fn parse_args() -> Option<Cli> {
+	#[derive(Clone, Copy)]
+	enum Subcommand {
+		Server,
+		Client,
+	}
+
 	let mut args = env::args_os().skip(1);
-	println!("{args:?}");
+
+	let mut server_port = 8080u16;
+	let mut client_port_range = 8081..=8090u16;
+	let mut subcommand: Option<Subcommand> = None;
+
+	for _ in 1..=2 {
+		let next = args.next()?;
+		let next = next.to_string_lossy();
+
+		if let Some(port) = next.strip_prefix("--port=") {
+			let mut a = port.splitn(2, ':');
+			server_port = a.next().and_then(|a| a.parse().ok())?;
+
+			let mut a = a.next()?.splitn(2, '-');
+			let client_start = a.next().and_then(|a| a.parse().ok())?;
+			let client_end = match a.next() {
+				Some(end) => end.parse().ok()?,
+				None => client_start,
+			};
+
+			client_port_range = if client_start > client_end {
+				client_end..=client_start
+			} else {
+				client_start..=client_end
+			};
+
+			continue;
+		} else {
+			subcommand = Some(match next.to_ascii_lowercase().as_str() {
+				"server" => Subcommand::Server,
+				"client" => Subcommand::Client,
+				_ => return None,
+			});
+			break;
+		}
+	}
+
+	let path = PathBuf::from(args.next()?);
+
+	let cli_command = match subcommand? {
+		Subcommand::Server => {
+			let options = args.collect();
+			CliCommand::Server {
+				gitstatusd_path: path,
+				gitstatusd_options: options,
+			}
+		}
+		Subcommand::Client => CliCommand::Client { cwd: path },
+	};
+
+	let cli = Cli {
+		server_port,
+		client_port: client_port_range,
+		command: cli_command,
+	};
+
+	Some(cli)
+}
+
+fn main() -> anyhow::Result<()> {
+	let args = parse_args().ok_or_else(|| anyhow!(USAGE))?;
 
 	let host = net::SocketAddr::from_str("[::1]:8080").unwrap();
 	let from = net::SocketAddr::from_str("[::1]:8081").unwrap();
@@ -249,4 +360,6 @@ fn main() -> io::Result<()> {
 		eprintln!("Unknown subcommand: {subcommand}");
 		Ok(())
 	}
+
+	Ok(())
 }
