@@ -1,14 +1,32 @@
+#![cfg(unix)]
 use std::collections::hash_map::{DefaultHasher, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::str::{from_utf8, FromStr};
 use std::sync::{Arc, Mutex};
-use std::{env, iter, net, ops, thread};
+use std::{
+	env, fs, iter,
+	net::{self, IpAddr, SocketAddr},
+	ops, thread, time,
+};
 
 use anyhow::anyhow;
+
+trait Localhost {
+	const LOCALHOST: Self;
+}
+
+impl Localhost for net::Ipv6Addr {
+	const LOCALHOST: Self = Self::LOCALHOST;
+}
+
+impl Localhost for net::Ipv4Addr {
+	const LOCALHOST: Self = Self::LOCALHOST;
+}
 
 macro_rules! git_repo {
 	(
@@ -74,6 +92,67 @@ git_repo! {
 	}
 }
 
+const BRANCH_SYMBOL: char = '\u{e0a0}';
+const REF_SYMBOL: char = '\u{27a6}';
+const DIRTY_SYMBOL: char = '\u{25cf}';
+const STAGED_SYMBOL: char = '\u{271a}';
+
+fn format_git_repo(repo: GitRepo<'_>) -> String {
+	let mut res = String::new();
+
+	let dirty = repo.staged_changes
+		+ repo.unstaged_changes
+		+ repo.conflicted_changes
+		+ repo.untracked_files
+		> 0;
+
+	if dirty {
+		res.push('@');
+	}
+
+	if let Some(branch) = repo.branch {
+		res.push(BRANCH_SYMBOL);
+		res.push(' ');
+		res.push_str(&String::from_utf8_lossy(branch));
+	} else {
+		res.push(REF_SYMBOL);
+		res.push(' ');
+
+		let hash = repo.commit_hash.chars().take(8);
+		for c in hash {
+			res.push(c)
+		}
+	}
+
+	if repo.ahead > 0 {
+		res.push_str(&format!("⇡ {}", repo.ahead));
+	}
+
+	if repo.behind > 0 {
+		res.push_str(&format!("⇣ {}", repo.behind));
+	}
+
+	// no untrack
+	if repo.staged_changes > 0
+		|| repo.unstaged_changes > 0
+		|| repo.conflicted_changes > 0
+	{
+		res.push(' ')
+	}
+
+	if repo.unstaged_changes > 0 {
+		res.push(DIRTY_SYMBOL);
+	}
+	if repo.staged_changes > 0 {
+		res.push(STAGED_SYMBOL);
+	}
+	if repo.conflicted_changes > 0 {
+		res.push_str("!!");
+	}
+
+	res
+}
+
 pub trait ConvertField<'a> {
 	fn from_field(field: &'a [u8]) -> Option<Self>
 	where
@@ -105,27 +184,34 @@ impl<'a, T: ConvertField<'a>> ConvertField<'a> for Option<T> {
 	#[inline]
 	fn from_field(field: &'a [u8]) -> Option<Self> {
 		if field.is_empty() {
-			None
+			Some(None)
 		} else {
 			Some(T::from_field(field))
 		}
 	}
 }
 
-fn parse_response(bytes: &[u8]) -> Option<Response<'_>> {
-	let mut records =
-		bytes.split(|&b| b == FIELD_SEPARATOR || b == RECORD_SEPARATOR);
+const ONE_MS: time::Duration = time::Duration::from_millis(1);
+
+fn sleep_little() {
+	thread::sleep(ONE_MS);
+}
+
+#[inline]
+fn is_separator(b: &u8) -> bool {
+	let b = *b;
+	b == FIELD_SEPARATOR || b == RECORD_SEPARATOR
+}
+
+fn parse_id(bytes: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
+	let mut records = bytes.splitn(3, is_separator);
 	let id = records.next()?;
-	let is_git_repo = records.next()? != [0];
+	let is_git_repo = records.next()? != [b'0'];
 
 	if !is_git_repo {
-		return Some(Response { id, data: None });
+		return Some((id, None));
 	}
-
-	Some(Response {
-		id,
-		data: GitRepo::new(&mut records),
-	})
+	Some((id, Some(records.next()?)))
 }
 
 fn make_request<H: Hasher + Default>(
@@ -144,7 +230,7 @@ fn make_request<H: Hasher + Default>(
 		.chain(&[FIELD_SEPARATOR])
 		.chain(path)
 		.chain(&[FIELD_SEPARATOR])
-		.chain(&[if read_git_index { 0 } else { 1 }])
+		.chain(&[if read_git_index { b'0' } else { b'1' }])
 		.chain(&[RECORD_SEPARATOR])
 		.copied()
 		.collect();
@@ -154,12 +240,13 @@ fn make_request<H: Hasher + Default>(
 
 fn server(
 	host: net::SocketAddr,
-	args: &mut impl Iterator<Item = impl AsRef<OsStr>>,
+	bin_path: PathBuf,
+	args: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> io::Result<()> {
 	let in_queue = Arc::new(Mutex::new(HashMap::<u64, net::SocketAddr>::new()));
 	let in_queue_clone = in_queue.clone();
 
-	let process_name = args.next().unwrap();
+	let process_name = bin_path;
 	let mut process = Command::new(process_name)
 		.args(args)
 		.stdin(Stdio::piped())
@@ -171,20 +258,31 @@ fn server(
 	let mut stdout = BufReader::new(process.stdout.take().unwrap());
 
 	let socket = Arc::new(net::UdpSocket::bind(host)?);
+	socket.set_read_timeout(Some(time::Duration::from_millis(1000)))?;
 	let socket_clone = socket.clone();
 
-	thread::spawn(move || {
+	let sender = thread::spawn(move || {
 		let socket = socket_clone;
 		let in_queue = in_queue_clone;
 		let mut buf = Vec::new();
 
 		while let Ok(len) = stdout.read_until(RECORD_SEPARATOR, &mut buf) {
-			buf.clear();
+			let chunk = &buf[..len];
 
-			let a = parse_response(&buf[..len]).expect("Unknown response");
-			println!("{a:?}");
+			let (id, rest) = match parse_id(chunk) {
+				Some(x) => x,
+				None => {
+					if chunk.last() == Some(&RECORD_SEPARATOR) {
+						eprintln!("Unknown response: {chunk:x?}");
+						continue;
+					} else {
+						eprintln!("{}", String::from_utf8_lossy(chunk));
+						break;
+					}
+				}
+			};
 
-			let id = from_utf8(a.id)
+			let id = from_utf8(id)
 				.ok()
 				.and_then(|s| u64::from_str_radix(s, 16).ok());
 
@@ -192,39 +290,57 @@ fn server(
 				let mut in_queue = in_queue.lock().unwrap();
 
 				if let Some(origin) = in_queue.remove(&id) {
-					let body = format!("{a:?}");
-					match socket.send_to(body.as_bytes(), origin) {
-						Ok(_) => {}
-						Err(e) => {
-							eprintln!("Sending error: {origin} -> {e:?}");
-						}
+					if let Err(e) = socket
+						.send_to(rest.unwrap_or(&[RECORD_SEPARATOR]), origin)
+					{
+						eprintln!("Sending error: {origin} -> {e:?}");
+						continue;
 					}
 				}
 			}
+
+			buf.clear();
 		}
 	});
 
-	let mut buf = [0; 4096];
+	let receiver = thread::spawn(move || -> io::Result<()> {
+		let mut buf = [0; 4096];
 
-	loop {
-		let (bytes, origin) = socket.recv_from(&mut buf)?;
-		if origin.ip() != host.ip() {
-			continue;
+		while process.try_wait().ok().flatten().is_none() {
+			let (bytes, origin) = match socket.recv_from(&mut buf) {
+				Ok(x) => x,
+				Err(e) => match e.kind() {
+					io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+						sleep_little();
+						continue;
+					}
+					_ => return Err(e),
+				},
+			};
+			if origin.ip() != host.ip() {
+				continue;
+			}
+
+			let (hash, request) =
+				make_request::<DefaultHasher>(&buf[..bytes], true);
+
+			stdin.write_all(&request)?;
+
+			{
+				in_queue.lock().unwrap().insert(hash, origin);
+			}
 		}
+		Ok(())
+	});
 
-		let (hash, request) =
-			make_request::<DefaultHasher>(&buf[..bytes], true);
-
-		stdin.write_all(&request)?;
-
-		{
-			in_queue.lock().unwrap().insert(hash, origin);
-		}
-	}
+	sender.join().ok();
+	receiver.join().ok();
+	Ok(())
 }
 
 fn client(
 	from: impl net::ToSocketAddrs,
+	cwd: PathBuf,
 	host: net::SocketAddr,
 ) -> io::Result<()> {
 	let socket = net::UdpSocket::bind(from)?;
@@ -232,9 +348,19 @@ fn client(
 
 	let mut buf = [0; 4096];
 
-	socket.send("hi there".as_bytes())?;
+	socket.send(cwd.into_os_string().as_bytes())?;
+	socket.set_read_timeout(Some(time::Duration::from_millis(500)))?;
+
 	let bytes = socket.recv(&mut buf)?;
-	println!("{:?}", &buf[0..bytes]);
+
+	let mut words = buf[0..bytes].split(is_separator);
+	let repo = GitRepo::new(&mut words);
+
+	if let Some(repo) = repo {
+		println!("{}", format_git_repo(repo));
+	} else {
+	}
+
 	Ok(())
 }
 
@@ -346,20 +472,23 @@ fn parse_args() -> Option<Cli> {
 
 fn main() -> anyhow::Result<()> {
 	let args = parse_args().ok_or_else(|| anyhow!(USAGE))?;
+	let localhost = IpAddr::V6(Localhost::LOCALHOST);
 
-	let host = net::SocketAddr::from_str("[::1]:8080").unwrap();
-	let from = net::SocketAddr::from_str("[::1]:8081").unwrap();
+	let host = SocketAddr::new(localhost, args.server_port);
+	let from: Vec<SocketAddr> = args
+		.client_port
+		.map(|port| SocketAddr::new(localhost, port))
+		.collect();
 
-	let subcommand = args.next().expect("Usage: cmd <subcommand>");
-	let subcommand = subcommand.to_string_lossy();
-	if subcommand == "server" {
-		server(host, &mut args)
-	} else if subcommand == "client" {
-		client(from, host)
-	} else {
-		eprintln!("Unknown subcommand: {subcommand}");
-		Ok(())
-	}
+	match args.command {
+		CliCommand::Server {
+			gitstatusd_path,
+			gitstatusd_options,
+		} => server(host, gitstatusd_path, gitstatusd_options),
+		CliCommand::Client { cwd } => {
+			client(from.as_slice(), fs::canonicalize(cwd)?, host)
+		}
+	}?;
 
 	Ok(())
 }
