@@ -9,7 +9,9 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::str::{from_utf8, FromStr};
 use std::sync::{Arc, Mutex};
 use std::{
-	env, fs, iter,
+	env,
+	fmt::{self, Write as FmtWrite},
+	fs, iter,
 	net::{self, IpAddr, SocketAddr},
 	ops, thread, time,
 };
@@ -83,8 +85,8 @@ git_repo! {
 		staged_deleted_files: u64,
 		push_remote_name: Option<&'a [u8]>,
 		push_remote_url: Option<&'a [u8]>,
-		ahead_push_remote: Option<&'a [u8]>,
-		behind_push_remote: Option<&'a [u8]>,
+		ahead_push_remote: u64,
+		behind_push_remote: u64,
 		skip_worktree_files: u64,
 		assume_unchanged_files: u64,
 		commit_message_encoding: Option<&'a str>,
@@ -97,60 +99,66 @@ const REF_SYMBOL: char = '\u{27a6}';
 const DIRTY_SYMBOL: char = '\u{25cf}';
 const STAGED_SYMBOL: char = '\u{271a}';
 
-fn format_git_repo(repo: GitRepo<'_>) -> String {
-	let mut res = String::new();
+impl fmt::Display for GitRepo<'_> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let mut res = String::new();
 
-	let dirty = repo.staged_changes
-		+ repo.unstaged_changes
-		+ repo.conflicted_changes
-		+ repo.untracked_files
-		> 0;
+		let dirty = self.staged_changes
+			+ self.unstaged_changes
+			+ self.conflicted_changes
+			+ self.untracked_files
+			> 0;
 
-	if dirty {
-		res.push('@');
-	}
+		f.write_char(if dirty {
+			'@'
+		} else if self.commit_hash.is_empty() {
+			'+'
+		} else {
+			' '
+		})?;
 
-	if let Some(branch) = repo.branch {
-		res.push(BRANCH_SYMBOL);
-		res.push(' ');
-		res.push_str(&String::from_utf8_lossy(branch));
-	} else {
-		res.push(REF_SYMBOL);
-		res.push(' ');
+		if let Some(branch) = self.branch {
+			f.write_char(BRANCH_SYMBOL)?;
+			f.write_char(' ')?;
+			f.write_str(&String::from_utf8_lossy(branch))?;
+		} else {
+			f.write_char(REF_SYMBOL)?;
+			f.write_char(' ')?;
 
-		let hash = repo.commit_hash.chars().take(8);
-		for c in hash {
-			res.push(c)
+			let hash = self.commit_hash.chars().take(8);
+			for c in hash {
+				f.write_char(c)?;
+			}
 		}
-	}
 
-	if repo.ahead > 0 {
-		res.push_str(&format!("⇡ {}", repo.ahead));
-	}
+		if self.ahead > 0 {
+			f.write_str(&format!("⇡ {}", self.ahead))?;
+		}
 
-	if repo.behind > 0 {
-		res.push_str(&format!("⇣ {}", repo.behind));
-	}
+		if self.behind > 0 {
+			f.write_str(&format!("⇣ {}", self.behind))?;
+		}
 
-	// no untrack
-	if repo.staged_changes > 0
-		|| repo.unstaged_changes > 0
-		|| repo.conflicted_changes > 0
-	{
-		res.push(' ')
-	}
+		// no untrack
+		if self.staged_changes > 0
+			|| self.unstaged_changes > 0
+			|| self.conflicted_changes > 0
+		{
+			f.write_char(' ')?;
+		}
 
-	if repo.unstaged_changes > 0 {
-		res.push(DIRTY_SYMBOL);
-	}
-	if repo.staged_changes > 0 {
-		res.push(STAGED_SYMBOL);
-	}
-	if repo.conflicted_changes > 0 {
-		res.push_str("!!");
-	}
+		if self.unstaged_changes > 0 {
+			f.write_char(DIRTY_SYMBOL)?;
+		}
+		if self.staged_changes > 0 {
+			f.write_char(STAGED_SYMBOL)?;
+		}
+		if self.conflicted_changes > 0 {
+			f.write_str("!!")?;
+		}
 
-	res
+		Ok(())
+	}
 }
 
 pub trait ConvertField<'a> {
@@ -357,7 +365,7 @@ fn client(
 	let repo = GitRepo::new(&mut words);
 
 	if let Some(repo) = repo {
-		println!("{}", format_git_repo(repo));
+		println!("{}", repo);
 	} else {
 	}
 
